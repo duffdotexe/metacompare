@@ -22,6 +22,12 @@ matches and what doesn't.
   every property it can, with the hashes marked unreadable rather than failing
   the whole comparison
 
+**Note** this project was created as a way to help save me some time when sorting through backup archives.
+I made the project public because I figured it could be useful to some other people.
+This is an entirely vibe coded project, and I don't plan on maintaining it unless there is demand.
+Please use at your own risk.
+-Duff
+
 ## Download
 
 Grab `MetaCompare.exe` from the
