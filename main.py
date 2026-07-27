@@ -15,7 +15,7 @@ import stat
 import sys
 import threading
 import tkinter as tk
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -65,6 +65,8 @@ HASH_CHUNK = 1024 * 1024
 MAX_CELL_LEN = 160
 POLL_INTERVAL_MS = 80
 KEY_SEPARATOR = " — "
+# Above this, a folder scan is worth confirming before it reads every file.
+LARGE_SCAN_PAIRS = 250
 
 STATUS_SAME = "Same"
 STATUS_DIFF = "Different"
@@ -574,6 +576,23 @@ def compare_metadata(meta1, meta2):
     return rows
 
 
+class Comparison:
+    """One pair of files and the result of comparing them."""
+
+    __slots__ = ("path1", "path2", "rows", "error")
+
+    def __init__(self, path1, path2, rows, error=None):
+        self.path1 = path1
+        self.path2 = path2
+        self.rows = rows or []
+        self.error = error
+
+    @property
+    def label(self):
+        stem = os.path.splitext(os.path.basename(self.path1))[0]
+        return stem or os.path.basename(self.path1)
+
+
 def summarize(rows):
     counts = {STATUS_SAME: 0, STATUS_DIFF: 0, STATUS_ONLY_1: 0, STATUS_ONLY_2: 0}
     for row in rows:
@@ -589,21 +608,154 @@ def files_are_identical(rows):
     return False
 
 
+# Properties that describe the file or its container rather than the photo
+# inside it. Comparing a .jpg with the .heic of the same shot, every one of
+# these differs by construction — different name, different bytes, different
+# format — so counting them as differences buries the ones that mean something.
+STRUCTURAL_KEYS = frozenset({
+    # The file on disk, not what it depicts.
+    "Name", "Extension", "MIME type (by extension)", "Encoding (by extension)",
+    "Size", "MD5", "SHA-256", "Created", "Modified", "Accessed",
+    "Read-only", "Hidden", "System",
+    # The container format, not the image it carries.
+    "Image format", "MIME type", "Compression", "Pixel format", "Endianness",
+    "Format version", "Comment", "Tile width", "Tile length",
+    # Reported by size only, and two formats serialize the same payload to
+    # different byte counts — a difference here is a hint to look closer, not
+    # evidence the photo's metadata disagrees.
+    "XMP", "ICC profile",
+})
+
+RowGroups = namedtuple("RowGroups", "content structural one_sided same")
+
+
+def partition_rows(rows):
+    """Group rows by how much a difference in them actually tells you.
+
+    ``content`` holds differing properties both files carry and that describe
+    the photo itself — the ones worth looking at first. ``structural`` holds
+    differences that follow from being two different files in two different
+    formats. ``one_sided`` holds properties only one file records at all.
+    """
+    content, structural, one_sided, same = [], [], [], []
+    for row in rows:
+        status = row[4]
+        if status == STATUS_SAME:
+            same.append(row)
+        elif status == STATUS_DIFF:
+            if row[1] in STRUCTURAL_KEYS:
+                structural.append(row)
+            else:
+                content.append(row)
+        else:
+            one_sided.append(row)
+    return RowGroups(content, structural, one_sided, same)
+
+
+def verdict(rows):
+    """A few words summarizing one comparison, for an at-a-glance column."""
+    if not rows:
+        return "no metadata"
+    groups = partition_rows(rows)
+    if groups.content:
+        return f"{len(groups.content)} different"
+    if files_are_identical(rows):
+        return "identical files"
+    if groups.one_sided or groups.structural:
+        return "no differences"
+    return "all match"
+
+
+# --------------------------------------------------------------------------
+# Folder pairing
+# --------------------------------------------------------------------------
+
+def index_by_stem(folder, recursive=False):
+    """Map each file name (without extension) to the files carrying it.
+
+    Names are matched case-insensitively, so IMG_1798.JPG pairs with
+    img_1798.heic the way Windows itself would treat them.
+    """
+    index = {}
+    try:
+        if recursive:
+            walked = []
+            for root, _dirs, files in os.walk(folder):
+                walked.extend(os.path.join(root, name) for name in files)
+        else:
+            with os.scandir(folder) as entries:
+                walked = [e.path for e in entries if e.is_file()]
+    except OSError:
+        return index
+    for path in walked:
+        stem, extension = os.path.splitext(os.path.basename(path))
+        if not stem or not extension:
+            continue  # no extension means nothing to pair across formats
+        index.setdefault(stem.casefold(), []).append(path)
+    for paths in index.values():
+        paths.sort(key=str.casefold)
+    return index
+
+
+def find_matching_pairs(folder1, folder2, recursive=False):
+    """Files whose name appears in both folders, as (path1, path2) pairs.
+
+    A name present in only one folder is ignored, which is the point: two
+    backup folders rarely hold the same set of shots.
+    """
+    index1 = index_by_stem(folder1, recursive)
+    index2 = index_by_stem(folder2, recursive)
+    pairs = []
+    for stem in sorted(set(index1) & set(index2)):
+        for path1 in index1[stem]:
+            for path2 in index2[stem]:
+                if _same_file(path1, path2):
+                    continue  # comparing a file with itself proves nothing
+                pairs.append((path1, path2))
+    return pairs
+
+
+def _same_file(path1, path2):
+    try:
+        return os.path.samefile(path1, path2)
+    except OSError:
+        return os.path.normcase(os.path.abspath(path1)) == os.path.normcase(
+            os.path.abspath(path2)
+        )
+
+
+# --------------------------------------------------------------------------
+# Reports
+# --------------------------------------------------------------------------
+
 def build_report(path1, path2, rows):
     """Plain-text comparison report suitable for the clipboard or a file."""
-    counts = summarize(rows)
+    return build_multi_report([Comparison(path1, path2, rows, None)])
+
+
+def _comparison_report_lines(comparison):
     lines = [
-        f"{APP_NAME} report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"File 1: {path1}",
-        f"File 2: {path2}",
-        (
-            f"Summary: {counts[STATUS_SAME]} same, {counts[STATUS_DIFF]} different, "
-            f"{counts[STATUS_ONLY_1] + counts[STATUS_ONLY_2]} present in only one file"
-        ),
-        "",
+        f"File 1: {comparison.path1}",
+        f"File 2: {comparison.path2}",
     ]
+    if comparison.error:
+        lines.append(f"  could not be compared: {comparison.error}")
+        return lines
+    groups = partition_rows(comparison.rows)
+    lines.append(
+        f"Summary: {len(groups.content)} metadata differences, "
+        f"{len(groups.structural)} file/format differences, "
+        f"{len(groups.same)} same, "
+        f"{len(groups.one_sided)} present in only one file"
+    )
+    if groups.content:
+        lines.append("")
+        lines.append("Metadata differences:")
+        for _sec, key, v1, v2, _status in groups.content:
+            lines.append(f"  {key}: {v1} | {v2}")
+    lines.append("")
     section = None
-    for sec, key, v1, v2, status in rows:
+    for sec, key, v1, v2, status in comparison.rows:
         if sec != section:
             section = sec
             lines.append(f"[{section}]")
@@ -613,6 +765,36 @@ def build_report(path1, path2, rows):
             lines.append(f"    file 1: {v1}")
         if status != STATUS_ONLY_1:
             lines.append(f"    file 2: {v2}")
+    return lines
+
+
+def build_multi_report(comparisons):
+    """Report covering one comparison or a whole folder scan."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"{APP_NAME} report — {stamp}"]
+    if len(comparisons) != 1:
+        differing = sum(
+            1 for c in comparisons if not c.error and partition_rows(c.rows).content
+        )
+        failed = sum(1 for c in comparisons if c.error)
+        lines.append(
+            f"{len(comparisons)} matching pairs · {differing} with differences"
+            + (f" · {failed} could not be read" if failed else "")
+        )
+        lines.append("")
+        lines.append("Overview:")
+        for comparison in comparisons:
+            name = os.path.basename(comparison.path1)
+            other = os.path.basename(comparison.path2)
+            state = comparison.error and "error" or verdict(comparison.rows)
+            lines.append(f"  {name} ↔ {other}: {state}")
+    lines.append("")
+    for index, comparison in enumerate(comparisons):
+        if len(comparisons) != 1:
+            lines.append("=" * 70)
+            lines.append(f"Pair {index + 1} of {len(comparisons)}")
+        lines.extend(_comparison_report_lines(comparison))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -669,7 +851,7 @@ def _ellipsize(text, limit=MAX_CELL_LEN):
 # --------------------------------------------------------------------------
 
 class DropZone(ttk.LabelFrame):
-    """One file slot: drop target, browse/clear buttons, current selection."""
+    """One slot holding a file or a folder: drop target, buttons, selection."""
 
     def __init__(self, master, title, on_files):
         super().__init__(master, text=title, padding=8)
@@ -697,10 +879,14 @@ class DropZone(ttk.LabelFrame):
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", pady=(6, 0))
-        browse = ttk.Button(buttons, text="Browse…", command=self.browse)
+        browse = ttk.Button(buttons, text="File…", width=8, command=self.browse)
         browse.pack(side="left")
-        clear = ttk.Button(buttons, text="Clear", command=self.clear)
-        clear.pack(side="left", padx=(6, 0))
+        browse_dir = ttk.Button(
+            buttons, text="Folder…", width=9, command=self.browse_folder
+        )
+        browse_dir.pack(side="left", padx=(4, 0))
+        clear = ttk.Button(buttons, text="Clear", width=7, command=self.clear)
+        clear.pack(side="left", padx=(4, 0))
 
         self._render()
 
@@ -708,9 +894,15 @@ class DropZone(ttk.LabelFrame):
             # Register the whole slot, not just the inner label: a file released
             # over the frame's padding or the button strip should land in the
             # slot the user aimed at rather than falling through to the window.
-            for widget in (self, self.label, buttons, browse, clear):
+            for widget in (self, self.label, buttons, browse, browse_dir, clear):
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind("<<Drop>>", self._on_drop)
+
+    # -- what is selected --------------------------------------------------
+
+    @property
+    def is_folder(self):
+        return bool(self.path) and os.path.isdir(self.path)
 
     # -- drop handling -----------------------------------------------------
 
@@ -727,6 +919,13 @@ class DropZone(ttk.LabelFrame):
 
     def browse(self):
         path = filedialog.askopenfilename(title=f"Choose a file for {self.cget('text')}")
+        if path:
+            self.on_files(self, [path])
+
+    def browse_folder(self):
+        path = filedialog.askdirectory(
+            title=f"Choose a folder for {self.cget('text')}", mustexist=True
+        )
         if path:
             self.on_files(self, [path])
 
@@ -751,8 +950,14 @@ class DropZone(ttk.LabelFrame):
         available = max(self.label.winfo_width() - 12, 80)
         measure = self._font.measure
         if self.path is None:
-            hint = "Drop a file here" if DND_AVAILABLE else "No file selected"
+            hint = "Drop a file or folder here" if DND_AVAILABLE else "Nothing selected"
             lines = [hint, "or click to browse", ""]
+        elif self.is_folder:
+            lines = [
+                fit_end("📁 " + os.path.basename(self.path), measure, available),
+                self._folder_summary(),
+                fit_middle(self.path, measure, available),
+            ]
         else:
             try:
                 size = human_size(os.path.getsize(self.path))
@@ -764,6 +969,14 @@ class DropZone(ttk.LabelFrame):
                 fit_middle(self.path, measure, available),
             ]
         self.label.configure(text="\n".join(lines))
+
+    def _folder_summary(self):
+        try:
+            with os.scandir(self.path) as entries:
+                files = sum(1 for entry in entries if entry.is_file())
+        except OSError:
+            return "folder"
+        return f"folder — {files:,} file{'' if files == 1 else 's'}"
 
 
 def parse_drop_data(widget, data):
@@ -782,9 +995,11 @@ class MetaCompareApp:
         self._apply_scaled_geometry()
 
         self._compare_seq = 0
-        self._rows = []
-        self._paths = (None, None)
+        self._comparisons = []
         self._results = queue.Queue()
+        self._cancel = None
+        self._row_ids = {}
+        self._positions = {}
 
         self._build_ui()
         self._poll_results()
@@ -813,19 +1028,29 @@ class MetaCompareApp:
         top.columnconfigure(0, weight=1, uniform="zones")
         top.columnconfigure(1, weight=1, uniform="zones")
 
-        self.zone1 = DropZone(top, "File 1", self._zone_files)
+        self.zone1 = DropZone(top, "File or folder 1", self._zone_files)
         self.zone1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.zone2 = DropZone(top, "File 2", self._zone_files)
+        self.zone2 = DropZone(top, "File or folder 2", self._zone_files)
         self.zone2.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         controls = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         controls.pack(fill="x")
         self.compare_btn = ttk.Button(controls, text="Compare", command=self.start_compare)
         self.compare_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(
+            controls, text="Cancel", command=self.cancel_compare, state="disabled"
+        )
+        self.cancel_btn.pack(side="left", padx=(6, 0))
+        self.recursive = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Include subfolders",
+            variable=self.recursive,
+        ).pack(side="left", padx=(12, 0))
         self.diff_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             controls,
-            text="Show differences only",
+            text="Hide matching pairs",
             variable=self.diff_only,
             command=self._refresh_tree,
         ).pack(side="left", padx=(12, 0))
@@ -865,6 +1090,12 @@ class MetaCompareApp:
         self.tree.tag_configure("diff", foreground="#c62828")
         self.tree.tag_configure("only", foreground="#b26a00")
         self.tree.tag_configure("section", font=("TkDefaultFont", 9, "bold"))
+        self.tree.tag_configure("pair", font=("TkDefaultFont", 9, "bold"),
+                                foreground="#1a7f37")
+        self.tree.tag_configure("pair_diff", font=("TkDefaultFont", 9, "bold"),
+                                foreground="#c62828")
+        self.tree.tag_configure("group", foreground="#555555")
+        self.tree.tag_configure("failed", foreground="#c62828")
         self.tree.bind("<Double-1>", self._show_row_detail)
 
         self.status_var = tk.StringVar()
@@ -874,7 +1105,10 @@ class MetaCompareApp:
         self._set_idle_status()
 
     def _set_idle_status(self):
-        self.status_var.set("Choose two files to compare their metadata.")
+        self.status_var.set(
+            "Choose two files, or two folders to compare every file whose name "
+            "appears in both."
+        )
 
     # -- file selection ----------------------------------------------------
 
@@ -906,19 +1140,19 @@ class MetaCompareApp:
 
     def _deliver(self, zone, paths):
         """Assign dropped or browsed *paths* to slots and re-compare."""
-        files = [p for p in paths if os.path.isfile(p)]
-        rejected = [p for p in paths if not os.path.isfile(p)]
+        usable = [p for p in paths if os.path.isfile(p) or os.path.isdir(p)]
+        rejected = [p for p in paths if p not in usable]
 
-        if files:
-            if len(files) > 1:
-                # A pair of files always fills 1 then 2, whatever was aimed at.
+        if usable:
+            if len(usable) > 1:
+                # A pair always fills slot 1 then 2, whatever was aimed at.
                 targets = [self.zone1, self.zone2]
             else:
                 target = zone or (
                     self.zone1 if self.zone1.path is None else self.zone2
                 )
                 targets = [target]
-            for target, path in zip(targets, files):
+            for target, path in zip(targets, usable):
                 target.set_path(path)
             self._invalidate_results()
             self._maybe_compare()
@@ -926,7 +1160,8 @@ class MetaCompareApp:
         if rejected:
             messagebox.showwarning(
                 APP_NAME,
-                "Only files can be compared — skipped:\n" + "\n".join(rejected[:5]),
+                "Only files and folders can be compared — skipped:\n"
+                + "\n".join(rejected[:5]),
             )
 
     def _maybe_compare(self):
@@ -938,40 +1173,113 @@ class MetaCompareApp:
     def _invalidate_results(self):
         """Drop results that no longer describe the selected files."""
         self._compare_seq += 1  # abandons any comparison still running
-        self._rows = []
-        self._paths = (None, None)
+        self.cancel_compare()
+        self._comparisons = []
         self.tree.delete(*self.tree.get_children())
         self.copy_btn.state(["disabled"])
         self.save_btn.state(["disabled"])
         self.compare_btn.state(["!disabled"])
+        self.cancel_btn.state(["disabled"])
         self._set_idle_status()
+
+    def cancel_compare(self):
+        if self._cancel is not None:
+            self._cancel.set()
 
     def start_compare(self):
         p1, p2 = self.zone1.path, self.zone2.path
         if not p1 or not p2:
             self._set_idle_status()
             return
-        missing = [p for p in (p1, p2) if not os.path.isfile(p)]
-        if missing:
+
+        folders = [os.path.isdir(p) for p in (p1, p2)]
+        if any(folders) and not all(folders):
             messagebox.showerror(
-                APP_NAME, "This file is no longer available:\n" + "\n".join(missing)
+                APP_NAME,
+                "Choose either two files or two folders.\n\n"
+                "With two folders, every file whose name appears in both is "
+                "compared and the rest are ignored.",
             )
             return
 
+        if all(folders):
+            pairs = self._folder_pairs(p1, p2)
+            if pairs is None:
+                return
+        else:
+            missing = [p for p in (p1, p2) if not os.path.isfile(p)]
+            if missing:
+                messagebox.showerror(
+                    APP_NAME,
+                    "This file is no longer available:\n" + "\n".join(missing),
+                )
+                return
+            pairs = [(p1, p2)]
+
         self._compare_seq += 1
         seq = self._compare_seq
+        self._cancel = threading.Event()
+        cancel = self._cancel
         self.compare_btn.state(["disabled"])
-        self.status_var.set("Comparing… (hashing large files can take a moment)")
+        self.cancel_btn.state(["!disabled"])
+        total = len(pairs)
+        self.status_var.set(
+            f"Comparing {total} pair{'' if total == 1 else 's'}…"
+            + (" (hashing large files can take a moment)" if total == 1 else "")
+        )
         results = self._results
 
         def worker():
-            try:
-                rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
-                results.put((seq, p1, p2, rows, None))
-            except Exception as exc:
-                results.put((seq, p1, p2, [], exc))
+            comparisons = []
+            for index, (first, second) in enumerate(pairs, 1):
+                if cancel.is_set():
+                    break
+                results.put(("progress", seq, index, total, first))
+                try:
+                    rows = compare_metadata(
+                        collect_metadata(first), collect_metadata(second)
+                    )
+                    comparisons.append(Comparison(first, second, rows))
+                except Exception as exc:
+                    # One unreadable file must not abandon the whole scan.
+                    comparisons.append(
+                        Comparison(
+                            first, second, [], f"{exc.__class__.__name__}: {exc}"
+                        )
+                    )
+            results.put(("done", seq, comparisons, cancel.is_set()))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _folder_pairs(self, folder1, folder2):
+        """Matching pairs in two folders, or None if the scan should not run."""
+        recursive = self.recursive.get()
+        self.status_var.set("Scanning folders…")
+        self.root.update_idletasks()
+        try:
+            pairs = find_matching_pairs(folder1, folder2, recursive)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Could not read the folders:\n{exc}")
+            self._set_idle_status()
+            return None
+        if not pairs:
+            self._set_idle_status()
+            messagebox.showinfo(
+                APP_NAME,
+                "No file name appears in both folders, so there is nothing to "
+                "compare."
+                + ("" if recursive else "\n\nTry 'Include subfolders'."),
+            )
+            return None
+        if len(pairs) > LARGE_SCAN_PAIRS and not messagebox.askokcancel(
+            APP_NAME,
+            f"Found {len(pairs):,} matching pairs.\n\n"
+            "Comparing them all means reading every one of those files, which "
+            "may take a while. You can stop partway with Cancel.\n\nContinue?",
+        ):
+            self._set_idle_status()
+            return None
+        return pairs
 
     def _poll_results(self):
         """Hand worker results to the UI from the main thread.
@@ -982,66 +1290,226 @@ class MetaCompareApp:
         """
         try:
             while True:
-                self._compare_done(*self._results.get_nowait())
+                message = self._results.get_nowait()
+                if message[0] == "progress":
+                    self._compare_progress(*message[1:])
+                else:
+                    self._compare_done(*message[1:])
         except queue.Empty:
             pass
         self.root.after(POLL_INTERVAL_MS, self._poll_results)
 
-    def _compare_done(self, seq, p1, p2, rows, error):
+    def _compare_progress(self, seq, index, total, path):
+        if seq != self._compare_seq or total == 1:
+            return
+        self.status_var.set(
+            f"Comparing {index:,} of {total:,} — {os.path.basename(path)}"
+        )
+
+    def _compare_done(self, seq, comparisons, cancelled):
         if seq != self._compare_seq:
             return  # superseded by a newer comparison, or the slots changed
         self.compare_btn.state(["!disabled"])
-        if error is not None:
-            self.status_var.set("Comparison failed.")
-            messagebox.showerror(
-                APP_NAME,
-                f"Could not compare these files:\n\n"
-                f"{error.__class__.__name__}: {error}",
-            )
+        self.cancel_btn.state(["disabled"])
+        self._cancel = None
+        self._comparisons = comparisons
+
+        if not comparisons:
+            self.status_var.set("Cancelled." if cancelled else "Nothing to compare.")
+            self.tree.delete(*self.tree.get_children())
             return
-        self._rows = rows
-        self._paths = (p1, p2)
+
         self.copy_btn.state(["!disabled"])
         self.save_btn.state(["!disabled"])
         self._refresh_tree()
-        counts = summarize(rows)
-        only = counts[STATUS_ONLY_1] + counts[STATUS_ONLY_2]
-        identical = " Files are byte-identical." if files_are_identical(rows) else ""
-        self.status_var.set(
-            f"{counts[STATUS_SAME]} same · {counts[STATUS_DIFF]} different · "
-            f"{only} present in only one file.{identical}"
+        self.status_var.set(self._summary_text(comparisons, cancelled))
+
+    @staticmethod
+    def _summary_text(comparisons, cancelled=False):
+        prefix = "Cancelled after " if cancelled else ""
+        if len(comparisons) == 1:
+            single = comparisons[0]
+            if single.error:
+                return f"Could not compare these files: {single.error}"
+            groups = partition_rows(single.rows)
+            identical = (
+                " Files are byte-identical."
+                if files_are_identical(single.rows)
+                else ""
+            )
+            count = len(groups.content)
+            return (
+                f"{count} metadata difference{'' if count == 1 else 's'} · "
+                f"{len(groups.structural)} file/format · "
+                f"{len(groups.same)} same · "
+                f"{len(groups.one_sided)} in only one file.{identical}"
+            )
+        differing = sum(
+            1 for c in comparisons if not c.error and partition_rows(c.rows).content
         )
+        failed = sum(1 for c in comparisons if c.error)
+        text = (
+            f"{prefix}{len(comparisons):,} pairs · {differing:,} with differences "
+            f"· {len(comparisons) - differing - failed:,} matching"
+        )
+        return text + (f" · {failed:,} unreadable." if failed else ".")
 
     # -- results view ------------------------------------------------------
 
     def _refresh_tree(self):
+        """Render results differences-first, with the full data tucked away.
+
+        Pairs that differ sort to the top, and within a pair the properties both
+        files carry come before the ones only one of them records. Everything
+        else lives under a collapsed 'All metadata' node.
+        """
         self.tree.delete(*self.tree.get_children())
-        diff_only = self.diff_only.get()
-        section_node = None
-        section = None
+        self._row_ids = {}
+        comparisons = self._comparisons
+        if not comparisons:
+            return
+
+        def rank(item):
+            _index, comparison = item
+            groups = partition_rows(comparison.rows)
+            return (
+                0 if comparison.error else 1,
+                -len(groups.content),
+                -len(groups.one_sided),
+                comparison.label.casefold(),
+            )
+
+        ordered = sorted(enumerate(comparisons), key=rank)
+        single = len(comparisons) == 1
+        hide_matching = self.diff_only.get()
         shown = 0
-        for index, (sec, key, v1, v2, status) in enumerate(self._rows):
-            if diff_only and status == STATUS_SAME:
+
+        for index, comparison in ordered:
+            groups = partition_rows(comparison.rows)
+            if hide_matching and not comparison.error and not groups.content:
                 continue
-            if sec != section:
-                section = sec
-                section_node = self.tree.insert(
-                    "", "end", iid=f"s{index}", text=sec, open=True, tags=("section",)
+            shown += 1
+            parent = "" if single else self._insert_pair_node(index, comparison)
+            if comparison.error:
+                self.tree.insert(
+                    parent,
+                    "end",
+                    text="Could not be compared",
+                    values=(_ellipsize(comparison.error), "", "Error"),
+                    tags=("failed",),
                 )
-            tag = {STATUS_SAME: "same", STATUS_DIFF: "diff"}.get(status, "only")
-            # The row id carries its index, so the detail dialog can never show
-            # a different row that happens to share this property name.
+                continue
+            self._insert_groups(parent, index, comparison, groups)
+
+        if not shown:
             self.tree.insert(
-                section_node,
+                "", "end", text="Every matching pair agrees", tags=("same",)
+            )
+
+    def _insert_pair_node(self, index, comparison):
+        """One collapsed line per pair: the names and a one-glance verdict."""
+        state = "Error" if comparison.error else verdict(comparison.rows)
+        differs = bool(
+            comparison.error or partition_rows(comparison.rows).content
+        )
+        return self.tree.insert(
+            "",
+            "end",
+            iid=f"p{index}",
+            text=comparison.label,
+            open=False,
+            values=(
+                os.path.basename(comparison.path1),
+                os.path.basename(comparison.path2),
+                state,
+            ),
+            tags=("pair_diff" if differs else "pair",),
+        )
+
+    def _insert_groups(self, parent, index, comparison, groups):
+        # Row identity by object, so a row that happens to equal another still
+        # resolves to its own position in the comparison.
+        self._positions = {
+            id(row): position for position, row in enumerate(comparison.rows)
+        }
+        if groups.content:
+            node = self.tree.insert(
+                parent,
                 "end",
-                iid=f"r{index}",
+                text="Metadata differences",
+                open=False,
+                values=("", "", f"{len(groups.content)}"),
+                tags=("group",),
+            )
+            self._insert_rows(node, index, comparison, groups.content)
+        elif parent:
+            self.tree.insert(
+                parent,
+                "end",
+                text="Metadata matches",
+                values=("", "", ""),
+                tags=("same",),
+            )
+
+        if groups.structural:
+            node = self.tree.insert(
+                parent,
+                "end",
+                text="File and format differences",
+                open=False,  # expected of two files in two formats
+                values=("", "", f"{len(groups.structural)}"),
+                tags=("group",),
+            )
+            self._insert_rows(node, index, comparison, groups.structural)
+
+        if groups.one_sided:
+            node = self.tree.insert(
+                parent,
+                "end",
+                text="In only one file",
+                open=False,
+                values=("", "", f"{len(groups.one_sided)}"),
+                tags=("group",),
+            )
+            self._insert_rows(node, index, comparison, groups.one_sided)
+
+        if comparison.rows:
+            node = self.tree.insert(
+                parent,
+                "end",
+                text="All metadata",
+                open=False,
+                values=("", "", f"{len(comparison.rows)}"),
+                tags=("group",),
+            )
+            section = None
+            section_node = node
+            for row in comparison.rows:
+                if row[0] != section:
+                    section = row[0]
+                    section_node = self.tree.insert(
+                        node, "end", text=section, open=False, tags=("section",)
+                    )
+                self._insert_rows(section_node, index, comparison, [row])
+
+    def _insert_rows(self, parent, index, comparison, rows):
+        for row in rows:
+            sec, key, v1, v2, status = row
+            tag = {STATUS_SAME: "same", STATUS_DIFF: "diff"}.get(status, "only")
+            # Every row is registered against its tree id, so the detail dialog
+            # resolves the exact row clicked. A row appears twice — once in its
+            # group and once under 'All metadata' — so ids cannot encode
+            # position alone.
+            iid = f"r{len(self._row_ids)}"
+            self._row_ids[iid] = (index, self._positions[id(row)])
+            self.tree.insert(
+                parent,
+                "end",
+                iid=iid,
                 text=key,
                 values=(_ellipsize(v1), _ellipsize(v2), status),
                 tags=(tag,),
             )
-            shown += 1
-        if self._rows and shown == 0:
-            self.tree.insert("", "end", text="No differences found", tags=("same",))
 
     def _show_row_detail(self, event):
         # Hit-test the click: focus() alone would reopen the last selected row
@@ -1049,25 +1517,27 @@ class MetaCompareApp:
         if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
             return
         item = self.tree.identify_row(event.y)
-        if not item or not item.startswith("r"):
+        located = self._row_ids.get(item)
+        if located is None:
             return
         try:
-            sec, key, v1, v2, status = self._rows[int(item[1:])]
-        except (ValueError, IndexError):
+            comparison = self._comparisons[located[0]]
+            sec, key, v1, v2, status = comparison.rows[located[1]]
+        except IndexError:
             return
         messagebox.showinfo(
             f"{APP_NAME} — {key}",
             f"Section: {sec}\nStatus: {status}\n\n"
-            f"File 1:\n{v1 or '(not present)'}\n\n"
-            f"File 2:\n{v2 or '(not present)'}",
+            f"File 1: {comparison.path1}\n{v1 or '(not present)'}\n\n"
+            f"File 2: {comparison.path2}\n{v2 or '(not present)'}",
         )
 
     # -- report ------------------------------------------------------------
 
     def copy_report(self):
-        if not self._rows:
+        if not self._comparisons:
             return
-        report = build_report(self._paths[0], self._paths[1], self._rows)
+        report = build_multi_report(self._comparisons)
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(report)
@@ -1077,7 +1547,7 @@ class MetaCompareApp:
         self.status_var.set("Report copied to clipboard.")
 
     def save_report(self):
-        if not self._rows:
+        if not self._comparisons:
             return
         path = filedialog.asksaveasfilename(
             title="Save comparison report",
@@ -1087,7 +1557,7 @@ class MetaCompareApp:
         )
         if not path:
             return
-        report = build_report(self._paths[0], self._paths[1], self._rows)
+        report = build_multi_report(self._comparisons)
         try:
             write_report(path, report)
         except (OSError, UnicodeError) as exc:

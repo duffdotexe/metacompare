@@ -251,6 +251,179 @@ class WriteReportTests(TempFileTestCase):
             self.assertIn("status: Same", fh.read())
 
 
+class FolderPairingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.a = os.path.join(self.root.name, "a")
+        self.b = os.path.join(self.root.name, "b")
+        os.makedirs(self.a)
+        os.makedirs(self.b)
+
+    def tearDown(self):
+        self.root.cleanup()
+
+    def touch(self, folder, name, data=b"x"):
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def stems(self, pairs):
+        return sorted(
+            os.path.splitext(os.path.basename(p1))[0].casefold() for p1, _p2 in pairs
+        )
+
+    def test_matches_same_name_different_extension(self):
+        self.touch(self.a, "IMG_1798.JPG")
+        self.touch(self.b, "IMG_1798.HEIC")
+        pairs = main.find_matching_pairs(self.a, self.b)
+        self.assertEqual(len(pairs), 1)
+        self.assertTrue(pairs[0][0].endswith("IMG_1798.JPG"))
+        self.assertTrue(pairs[0][1].endswith("IMG_1798.HEIC"))
+
+    def test_unmatched_names_are_ignored(self):
+        self.touch(self.a, "IMG_1798.JPG")
+        self.touch(self.a, "IMG_9999.JPG")
+        self.touch(self.b, "IMG_1798.HEIC")
+        self.touch(self.b, "IMG_0001.HEIC")
+        self.assertEqual(self.stems(main.find_matching_pairs(self.a, self.b)),
+                         ["img_1798"])
+
+    def test_name_matching_ignores_case(self):
+        self.touch(self.a, "IMG_1798.JPG")
+        self.touch(self.b, "img_1798.heic")
+        self.assertEqual(len(main.find_matching_pairs(self.a, self.b)), 1)
+
+    def test_subfolders_excluded_unless_requested(self):
+        self.touch(self.a, os.path.join("nested", "DEEP.JPG"))
+        self.touch(self.b, "DEEP.HEIC")
+        self.assertEqual(main.find_matching_pairs(self.a, self.b), [])
+        pairs = main.find_matching_pairs(self.a, self.b, recursive=True)
+        self.assertEqual(self.stems(pairs), ["deep"])
+
+    def test_files_without_an_extension_are_skipped(self):
+        self.touch(self.a, "README")
+        self.touch(self.b, "README")
+        self.assertEqual(main.find_matching_pairs(self.a, self.b), [])
+
+    def test_same_folder_twice_yields_no_self_pairs(self):
+        self.touch(self.a, "IMG_1798.JPG")
+        self.touch(self.a, "IMG_1798.HEIC")
+        pairs = main.find_matching_pairs(self.a, self.a)
+        for path1, path2 in pairs:
+            self.assertNotEqual(os.path.normcase(path1), os.path.normcase(path2))
+
+    def test_one_name_with_several_extensions_pairs_each(self):
+        self.touch(self.a, "shot.jpg")
+        self.touch(self.a, "shot.png")
+        self.touch(self.b, "shot.heic")
+        self.assertEqual(len(main.find_matching_pairs(self.a, self.b)), 2)
+
+    def test_missing_folder_is_not_an_error(self):
+        self.assertEqual(main.index_by_stem(os.path.join(self.root.name, "nope")), {})
+
+    def test_pairs_are_returned_in_name_order(self):
+        for name in ("c.jpg", "a.jpg", "b.jpg"):
+            self.touch(self.a, name)
+            self.touch(self.b, name.replace(".jpg", ".heic"))
+        self.assertEqual(self.stems(main.find_matching_pairs(self.a, self.b)),
+                         ["a", "b", "c"])
+
+
+class PartitionAndVerdictTests(unittest.TestCase):
+    def rows(self):
+        return [
+            ("s", "same1", "1", "1", STATUS_SAME),
+            ("s", "Camera model", "iPhone 12", "iPhone 14", STATUS_DIFF),
+            ("s", "only1", "1", "", STATUS_ONLY_1),
+            ("s", "same2", "3", "3", STATUS_SAME),
+            ("s", "only2", "", "2", STATUS_ONLY_2),
+        ]
+
+    def test_partition_groups_by_status(self):
+        groups = main.partition_rows(self.rows())
+        self.assertEqual([r[1] for r in groups.content], ["Camera model"])
+        self.assertEqual([r[1] for r in groups.one_sided], ["only1", "only2"])
+        self.assertEqual([r[1] for r in groups.same], ["same1", "same2"])
+        self.assertEqual(groups.structural, [])
+
+    def test_partition_of_nothing(self):
+        self.assertEqual(main.partition_rows([]), ([], [], [], []))
+
+    def test_file_and_format_differences_are_kept_apart(self):
+        """A .jpg and a .heic always differ in name, bytes and format."""
+        rows = [
+            ("File system", "Name", "a.jpg", "a.heic", STATUS_DIFF),
+            ("File system", "Extension", ".jpg", ".heic", STATUS_DIFF),
+            ("File system", "Size", "1 KB", "2 KB", STATUS_DIFF),
+            ("File system", "MD5", "aa", "bb", STATUS_DIFF),
+            ("File system", "SHA-256", "aa", "bb", STATUS_DIFF),
+            ("Embedded metadata", "Image format", "JPEG", "HEIF", STATUS_DIFF),
+            ("Embedded metadata", "MIME type", "image/jpeg", "image/heif",
+             STATUS_DIFF),
+            ("Embedded metadata", "Camera model", "iPhone 12", "iPhone 14",
+             STATUS_DIFF),
+        ]
+        groups = main.partition_rows(rows)
+        self.assertEqual([r[1] for r in groups.content], ["Camera model"])
+        self.assertEqual(len(groups.structural), 7)
+
+    def test_verdict_ignores_file_and_format_differences(self):
+        """Otherwise every cross-format pair would read the same."""
+        rows = [
+            ("File system", "Name", "a.jpg", "a.heic", STATUS_DIFF),
+            ("File system", "SHA-256", "aa", "bb", STATUS_DIFF),
+            ("Embedded metadata", "Image format", "JPEG", "HEIF", STATUS_DIFF),
+        ]
+        self.assertEqual(main.verdict(rows), "no differences")
+
+    def test_verdict_counts_differences_first(self):
+        self.assertEqual(main.verdict(self.rows()), "1 different")
+
+    def test_verdict_without_differences(self):
+        rows = [r for r in self.rows() if r[4] != STATUS_DIFF]
+        self.assertEqual(main.verdict(rows), "no differences")
+
+    def test_verdict_for_identical_files(self):
+        digest = "a" * 64
+        rows = [("File system", "SHA-256", digest, digest, STATUS_SAME)]
+        self.assertEqual(main.verdict(rows), "identical files")
+
+    def test_verdict_with_no_metadata(self):
+        self.assertEqual(main.verdict([]), "no metadata")
+
+
+class MultiReportTests(TempFileTestCase):
+    def _comparison(self, name, status=STATUS_DIFF):
+        rows = [("File system", "Name", f"{name}.jpg", f"{name}.heic", status)]
+        return main.Comparison(
+            self.path(f"{name}.jpg"), self.path(f"{name}.heic"), rows
+        )
+
+    def test_single_pair_report_matches_the_old_shape(self):
+        rows = [("File system", "Name", "a.jpg", "a.heic", STATUS_DIFF)]
+        report = build_report("a.jpg", "a.heic", rows)
+        self.assertIn("File 1: a.jpg", report)
+        self.assertIn("Summary:", report)
+        self.assertNotIn("Overview:", report)
+
+    def test_multi_pair_report_leads_with_an_overview(self):
+        comparisons = [self._comparison("one"), self._comparison("two")]
+        report = main.build_multi_report(comparisons)
+        self.assertIn("2 matching pairs", report)
+        self.assertIn("Overview:", report)
+        self.assertIn("one.jpg ↔ one.heic", report)
+        self.assertIn("Pair 1 of 2", report)
+        self.assertIn("Pair 2 of 2", report)
+
+    def test_failed_pair_is_reported_not_hidden(self):
+        broken = main.Comparison("a.jpg", "a.heic", [], "PermissionError: denied")
+        report = main.build_multi_report([broken, self._comparison("ok")])
+        self.assertIn("could not be compared: PermissionError: denied", report)
+        self.assertIn("1 could not be read", report)
+
+
 class HumanizeTagTests(unittest.TestCase):
     def test_camel_case_becomes_a_sentence(self):
         self.assertEqual(main.humanize_tag("LensModel"), "Lens model")
