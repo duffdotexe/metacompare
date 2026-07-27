@@ -34,6 +34,7 @@ jobs:
           --icon assets/icon.ico
           --collect-all tkinterdnd2
           --collect-submodules hachoir
+          --collect-all pillow_heif
           main.py
       - uses: actions/upload-artifact@v4
         with:

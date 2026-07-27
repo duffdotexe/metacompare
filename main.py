@@ -10,6 +10,7 @@ import hashlib
 import mimetypes
 import os
 import queue
+import re
 import stat
 import sys
 import threading
@@ -41,6 +42,23 @@ try:
     HACHOIR_AVAILABLE = True
 except ImportError:
     HACHOIR_AVAILABLE = False
+
+try:
+    from PIL import ExifTags, Image
+
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
+try:
+    # hachoir has no HEIF parser, so a HEIC photo would otherwise report nothing
+    # beyond its file-system properties.
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
+except ImportError:
+    HEIF_AVAILABLE = False
 
 APP_NAME = "MetaCompare"
 HASH_CHUNK = 1024 * 1024
@@ -172,11 +190,334 @@ def embedded_metadata(path):
     return props
 
 
+# hachoir's own spellings for the properties it also reports. Reusing them lets
+# a photo Pillow can read line up against one only hachoir can parse — a camera
+# raw file, say — instead of producing two one-sided rows.
+HACHOIR_KEY_ALIASES = {
+    "Make": "Camera manufacturer",
+    "Model": "Camera model",
+    "Software": "Producer",
+    "FNumber": "Camera focal",  # hachoir files the f-number under this name
+    "ExposureTime": "Camera exposure",
+    "FocalLength": "Focal length",
+    "ISOSpeedRatings": "ISO speed rating",
+    "PhotographicSensitivity": "ISO speed rating",
+    "DateTimeOriginal": "Date-time original",
+    "Orientation": "Image orientation",
+}
+
+# Matches hachoir's table so the two agree on wording.
+ORIENTATION_NAMES = {
+    1: "Horizontal (normal)",
+    2: "Mirrored horizontal",
+    3: "Rotated 180",
+    4: "Mirrored vertical",
+    5: "Mirrored horizontal then rotated 90 counter-clock-wise",
+    6: "Rotated 90 clock-wise",
+    7: "Mirrored horizontal then rotated 90 clock-wise",
+    8: "Rotated 90 counter clock-wise",
+}
+
+BITS_PER_MODE = {
+    "1": 1, "L": 8, "LA": 16, "P": 8, "PA": 16, "RGB": 24, "RGBA": 32,
+    "RGBX": 32, "CMYK": 32, "YCbCr": 24, "LAB": 24, "HSV": 24, "I": 32,
+    "F": 32, "I;16": 16, "I;16B": 16, "I;16L": 16,
+}
+
+# Pointers, binary blobs, and duplicates of the real image dimensions.
+SKIP_EXIF_TAGS = frozenset({
+    "ExifOffset", "GPSInfo", "MakerNote", "PrintImageMatching",
+    "ComponentsConfiguration", "InteroperabilityOffset",
+    "ExifInteroperabilityOffset", "XMLPacket", "ImageResources", "IPTCNAA",
+    "PhotoshopSettings", "ThumbnailOffset", "ThumbnailLength", "StripOffsets",
+    "StripByteCounts", "ImageWidth", "ImageLength", "PixelXDimension",
+    "PixelYDimension", "ExifImageWidth", "ExifImageHeight", "TileOffsets",
+    "TileByteCounts", "JPEGInterchangeFormat", "JPEGInterchangeFormatLength",
+    "OpcodeList1", "OpcodeList2", "OpcodeList3", "CFAPattern", "SceneType",
+    "FileSource",
+})
+
+MAX_EXIF_TEXT = 200
+
+
+def _deg_to_float(degree, minute, second):
+    """hachoir's exact conversion, so decimal coordinates match bit for bit."""
+    return degree + (float(minute) + float(second) / 60.0) / 60.0
+
+
+def humanize_tag(name):
+    """'LensModel' -> 'Lens model', 'ISOSpeedRatings' -> 'ISO speed ratings'."""
+    parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z']*|[a-z']+|\d+", str(name))
+    if not parts:
+        return str(name)
+    words = [parts[0]]
+    for part in parts[1:]:
+        words.append(part if part.isupper() and len(part) > 1 else part.lower())
+    return " ".join(words)
+
+
+def _exif_text(value, depth=0):
+    """Render an EXIF value as readable text, or None to leave it out."""
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8").replace("\x00", "").strip()
+        except UnicodeDecodeError:
+            return None  # a binary blob is noise in a comparison
+        return text or None
+    if isinstance(value, (tuple, list)):
+        if depth:
+            return None  # nested sequences are structure, not information
+        parts = [_exif_text(item, depth + 1) for item in value]
+        if not parts or any(part is None for part in parts):
+            return None
+        return ", ".join(parts)
+    if isinstance(value, str):
+        text = value.replace("\x00", "").strip()
+        return text or None
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, int):
+        return str(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        text = str(value).replace("\x00", "").strip()
+        return text or None
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.6g}"
+
+
+def _exif_datetime(value):
+    """EXIF stamps are 'YYYY:MM:DD HH:MM:SS'; show them like every other date."""
+    text = _exif_text(value)
+    if not text:
+        return None
+    match = re.match(r"^(\d{4}):(\d{2}):(\d{2})[ T](.+)$", text)
+    if match:
+        y, m, d, rest = match.groups()
+        return f"{y}-{m}-{d} {rest}"
+    return text
+
+
+def _format_exif_entry(tag, value):
+    """Return (key, text) for one EXIF tag, or None to skip it."""
+    if tag in SKIP_EXIF_TAGS:
+        return None
+    key = HACHOIR_KEY_ALIASES.get(tag, humanize_tag(tag))
+
+    if tag == "Orientation":
+        try:
+            return key, ORIENTATION_NAMES.get(int(value), _exif_text(value))
+        except (TypeError, ValueError):
+            return None
+    if tag == "ExposureTime":
+        try:
+            seconds = float(value)
+            if seconds > 0:
+                return key, "1/%g" % (1 / seconds)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return None
+    if tag in ("FNumber", "FocalLength", "ApertureValue", "MaxApertureValue"):
+        try:
+            return key, "%.3g" % float(value)
+        except (TypeError, ValueError):
+            return None
+    if tag in ("ISOSpeedRatings", "PhotographicSensitivity"):
+        if isinstance(value, (tuple, list)):
+            value = value[0] if value else None
+        text = _exif_text(value)
+        return (key, text) if text else None
+    if tag.startswith("DateTime") or tag in ("GPSDateStamp",):
+        text = _exif_datetime(value)
+        return (key, text) if text else None
+
+    text = _exif_text(value)
+    if text is None or len(text) > MAX_EXIF_TEXT:
+        return None
+    return key, text
+
+
+def _gps_metadata(gps_ifd):
+    """Decimal latitude/longitude/altitude plus the remaining GPS tags."""
+    props = OrderedDict()
+    named = {}
+    for tag_id, value in gps_ifd.items():
+        named[ExifTags.GPSTAGS.get(tag_id, str(tag_id))] = value
+
+    for axis, ref_tag, value_tag, negative in (
+        ("Latitude", "GPSLatitudeRef", "GPSLatitude", "S"),
+        ("Longitude", "GPSLongitudeRef", "GPSLongitude", "W"),
+    ):
+        coords = named.get(value_tag)
+        ref = _exif_text(named.get(ref_tag, "")) or ""
+        if not coords or len(coords) != 3:
+            continue
+        try:
+            degrees = _deg_to_float(*(float(part) for part in coords))
+        except (TypeError, ValueError):
+            continue
+        if ref.upper().startswith(negative):
+            degrees = -degrees
+        props[axis] = repr(degrees)
+
+    altitude = named.get("GPSAltitude")
+    if altitude is not None:
+        try:
+            metres = float(altitude)
+            if _exif_text(named.get("GPSAltitudeRef", 0)) == "1":
+                metres = -metres
+            props["Altitude"] = "%.1f meters" % metres
+        except (TypeError, ValueError):
+            pass
+
+    handled = {
+        "GPSLatitude", "GPSLatitudeRef", "GPSLongitude", "GPSLongitudeRef",
+        "GPSAltitude", "GPSAltitudeRef", "GPSVersionID",
+    }
+    for tag, value in named.items():
+        if tag in handled:
+            continue
+        if tag == "GPSTimeStamp" and isinstance(value, (tuple, list)):
+            try:
+                props["GPS time stamp"] = ":".join(
+                    "%02d" % int(float(part)) for part in value
+                )
+                continue
+            except (TypeError, ValueError):
+                pass
+        entry = _format_exif_entry(tag, value)
+        if entry:
+            props[entry[0]] = entry[1]
+    return props
+
+
+def image_metadata(path):
+    """Normalized image and EXIF metadata, keyed identically across formats.
+
+    This is what lets a .jpg and the .heic of the same photo line up: both are
+    read through Pillow, so the two produce the same key names rather than each
+    speaking its own format's vocabulary.
+    """
+    props = OrderedDict()
+    if not PILLOW_AVAILABLE:
+        return props
+    # Own the handle: Image.open() raises before the `with` engages when it
+    # cannot identify a file, which would leak the descriptor and keep a
+    # Windows lock on every non-image file compared.
+    handle = None
+    try:
+        handle = open(path, "rb")
+        with Image.open(handle) as im:
+            exif = im.getexif()
+
+            # pillow-heif rotates a HEIC's pixels when it opens the file, resets
+            # the EXIF orientation to 1, and records the real value here. Left
+            # alone, that makes every portrait photo look different from its own
+            # JPEG twin — different orientation and swapped dimensions — so
+            # report the geometry and orientation as the file actually stores
+            # them, which is what every other format reports.
+            stored_orientation = im.info.get("original_orientation")
+            try:
+                stored_orientation = int(stored_orientation)
+            except (TypeError, ValueError):
+                stored_orientation = None
+
+            width, height = im.size
+            if stored_orientation in (5, 6, 7, 8):
+                width, height = height, width
+            props["Image width"] = "%s pixels" % width
+            props["Image height"] = "%s pixels" % height
+
+            orientation = stored_orientation
+            if not orientation and exif:
+                try:
+                    orientation = int(exif.get(ExifTags.Base.Orientation))
+                except (TypeError, ValueError):
+                    orientation = None
+            if orientation:
+                props["Image orientation"] = ORIENTATION_NAMES.get(
+                    orientation, str(orientation)
+                )
+
+            if im.format:
+                props["Image format"] = im.format
+                mime = Image.MIME.get(im.format)
+                if mime:
+                    props["MIME type"] = mime
+            if im.mode:
+                props["Color mode"] = im.mode
+                if im.mode in BITS_PER_MODE:
+                    props["Bits/pixel"] = str(BITS_PER_MODE[im.mode])
+            frames = getattr(im, "n_frames", 1)
+            if frames and frames > 1:
+                props["Frame count"] = str(frames)
+            if im.info.get("icc_profile"):
+                props["ICC profile"] = "present (%d bytes)" % len(
+                    im.info["icc_profile"]
+                )
+
+            if exif:
+                for tag_id, value in exif.items():
+                    entry = _format_exif_entry(
+                        ExifTags.TAGS.get(tag_id, str(tag_id)), value
+                    )
+                    if entry:
+                        props.setdefault(entry[0], entry[1])
+                try:
+                    exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+                except (AttributeError, KeyError, OSError, ValueError):
+                    exif_ifd = None
+                for tag_id, value in (exif_ifd or {}).items():
+                    entry = _format_exif_entry(
+                        ExifTags.TAGS.get(tag_id, str(tag_id)), value
+                    )
+                    if entry:
+                        props.setdefault(entry[0], entry[1])
+                try:
+                    gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
+                except (AttributeError, KeyError, OSError, ValueError):
+                    gps_ifd = None
+                if gps_ifd:
+                    for key, value in _gps_metadata(gps_ifd).items():
+                        props.setdefault(key, value)
+
+            # hachoir reports a creation date for formats it parses; derive the
+            # same key so those comparisons stay aligned.
+            if "Date-time original" in props:
+                props.setdefault("Creation date", props["Date-time original"])
+            elif "Date time" in props:
+                props.setdefault("Creation date", props["Date time"])
+
+            if im.info.get("xmp"):
+                props["XMP"] = "present (%d bytes)" % len(im.info["xmp"])
+    except Exception:
+        # Not an image, an unsupported variant, or a damaged file: the other
+        # extractors still have something to say about it.
+        return OrderedDict()
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+    return props
+
+
 def collect_metadata(path):
     """Return {section_name: OrderedDict(key -> value)} for one file."""
     sections = OrderedDict()
     sections["File system"] = filesystem_metadata(path)
-    sections["Embedded metadata"] = embedded_metadata(path)
+
+    # Normalized image metadata comes first and wins on conflicts: it is the
+    # only extractor that names a JPEG's properties the same way it names a
+    # HEIC's. hachoir then adds whatever it knows that Pillow does not, which
+    # is everything for audio, video, documents and archives.
+    merged = image_metadata(path)
+    for key, value in embedded_metadata(path).items():
+        merged.setdefault(key, value)
+    sections["Embedded metadata"] = merged
     return sections
 
 

@@ -1,2 +1,6 @@
 tkinterdnd2>=0.4.2
 hachoir>=3.3.0
+pillow>=10.0
+# HEIC/HEIF support: hachoir has no HEIF parser, so without this an iPhone
+# photo reports nothing beyond its file-system properties.
+pillow-heif>=1.0.0

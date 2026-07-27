@@ -251,6 +251,174 @@ class WriteReportTests(TempFileTestCase):
             self.assertIn("status: Same", fh.read())
 
 
+class HumanizeTagTests(unittest.TestCase):
+    def test_camel_case_becomes_a_sentence(self):
+        self.assertEqual(main.humanize_tag("LensModel"), "Lens model")
+        self.assertEqual(main.humanize_tag("WhiteBalance"), "White balance")
+
+    def test_acronyms_stay_upper_case(self):
+        self.assertEqual(main.humanize_tag("ISOSpeedRatings"), "ISO speed ratings")
+        self.assertEqual(main.humanize_tag("GPSImgDirection"), "GPS img direction")
+
+    def test_single_word_unchanged(self):
+        self.assertEqual(main.humanize_tag("Flash"), "Flash")
+
+
+class ImageMetadataTests(TempFileTestCase):
+    """A .jpg and the .heic of the same photo must line up key for key."""
+
+    IDENTITY_KEYS = (
+        "Camera manufacturer", "Camera model", "Producer", "Date-time original",
+        "Creation date", "Camera exposure", "Camera focal", "Focal length",
+        "ISO speed rating", "Lens model", "Latitude", "Longitude", "Altitude",
+        "Image width", "Image height", "Image orientation", "Color mode",
+    )
+
+    def setUp(self):
+        super().setUp()
+        if not main.PILLOW_AVAILABLE:
+            self.skipTest("Pillow not installed")
+        from PIL import ExifTags, Image
+
+        self.Image = Image
+        self.ExifTags = ExifTags
+
+    def _exif_blob(self, orientation=1):
+        Image, ExifTags = self.Image, self.ExifTags
+        exif = Image.Exif()
+        exif[ExifTags.Base.Make] = "Apple"
+        exif[ExifTags.Base.Model] = "iPhone 15 Pro"
+        exif[ExifTags.Base.Software] = "18.1"
+        exif[ExifTags.Base.DateTime] = "2026:03:14 09:26:53"
+        exif[ExifTags.Base.Orientation] = orientation
+        sub = exif.get_ifd(ExifTags.IFD.Exif)
+        sub[ExifTags.Base.DateTimeOriginal] = "2026:03:14 09:26:53"
+        sub[ExifTags.Base.ExposureTime] = 1 / 120
+        sub[ExifTags.Base.FNumber] = 1.78
+        sub[ExifTags.Base.ISOSpeedRatings] = 64
+        sub[ExifTags.Base.FocalLength] = 6.86
+        sub[ExifTags.Base.LensModel] = "iPhone 15 Pro back camera 6.86mm f/1.78"
+        gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        gps[ExifTags.GPS.GPSLatitudeRef] = "N"
+        gps[ExifTags.GPS.GPSLatitude] = (40.0, 44.0, 54.30)
+        gps[ExifTags.GPS.GPSLongitudeRef] = "W"
+        gps[ExifTags.GPS.GPSLongitude] = (73.0, 59.0, 8.90)
+        gps[ExifTags.GPS.GPSAltitude] = 101.3
+        return exif.tobytes()
+
+    def _pair(self, orientation=1):
+        """The same image and EXIF written as both a JPEG and a HEIC."""
+        img = self.Image.new("RGB", (64, 48), (120, 160, 200))
+        blob = self._exif_blob(orientation)
+        jpg = self.path(f"photo{orientation}.jpg")
+        heic = self.path(f"photo{orientation}.heic")
+        img.save(jpg, "JPEG", quality=90, exif=blob)
+        img.save(heic, "HEIF", quality=90, exif=blob)
+        return jpg, heic
+
+    def test_jpeg_exif_is_extracted(self):
+        jpg, _ = self._pair()
+        meta = main.image_metadata(jpg)
+        self.assertEqual(meta["Camera model"], "iPhone 15 Pro")
+        self.assertEqual(meta["Camera exposure"], "1/120")
+        self.assertEqual(meta["Camera focal"], "1.78")
+        self.assertEqual(meta["ISO speed rating"], "64")
+        self.assertEqual(meta["Date-time original"], "2026-03-14 09:26:53")
+
+    def test_heic_metadata_is_not_empty(self):
+        """The bug this fixes: a HEIC reported nothing but file-system data."""
+        if not main.HEIF_AVAILABLE:
+            self.skipTest("pillow-heif not installed")
+        _, heic = self._pair()
+        meta = main.image_metadata(heic)
+        self.assertTrue(meta, "no metadata extracted from the HEIC at all")
+        self.assertEqual(meta["Camera model"], "iPhone 15 Pro")
+        self.assertEqual(meta["Date-time original"], "2026-03-14 09:26:53")
+
+    def test_heic_and_jpeg_identity_fields_match(self):
+        if not main.HEIF_AVAILABLE:
+            self.skipTest("pillow-heif not installed")
+        jpg, heic = self._pair()
+        rows = compare_metadata(collect_metadata(jpg), collect_metadata(heic))
+        found = {
+            key: (v1, v2, status)
+            for sec, key, v1, v2, status in rows
+            if sec == "Embedded metadata"
+        }
+        for key in self.IDENTITY_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, found, f"{key} missing from the comparison")
+                v1, v2, status = found[key]
+                self.assertEqual(
+                    status, STATUS_SAME, f"{key}: {v1!r} vs {v2!r}"
+                )
+
+    def test_portrait_photos_are_not_falsely_different(self):
+        """pillow-heif rotates HEIC pixels and resets the EXIF orientation."""
+        if not main.HEIF_AVAILABLE:
+            self.skipTest("pillow-heif not installed")
+        for orientation in (6, 8):
+            with self.subTest(orientation=orientation):
+                jpg, heic = self._pair(orientation)
+                rows = compare_metadata(
+                    collect_metadata(jpg), collect_metadata(heic)
+                )
+                geometry = {
+                    key: (v1, v2, status)
+                    for _s, key, v1, v2, status in rows
+                    if key in ("Image width", "Image height", "Image orientation")
+                }
+                for key, (v1, v2, status) in geometry.items():
+                    self.assertEqual(
+                        status, STATUS_SAME, f"{key}: {v1!r} vs {v2!r}"
+                    )
+                self.assertEqual(geometry["Image width"][0], "64 pixels")
+
+    def test_gps_matches_hachoirs_arithmetic(self):
+        """Coordinates must agree with hachoir's, or raw-vs-jpeg falsely differs."""
+        jpg, _ = self._pair()
+        mine = main.image_metadata(jpg)
+        theirs = main.embedded_metadata(jpg)
+        if not main.HACHOIR_AVAILABLE or "Latitude" not in theirs:
+            self.skipTest("hachoir did not report coordinates")
+        self.assertEqual(mine["Latitude"], theirs["Latitude"])
+        self.assertEqual(mine["Longitude"], theirs["Longitude"])
+        self.assertEqual(mine["Altitude"], theirs["Altitude"])
+
+    def test_overlapping_keys_use_hachoirs_spelling(self):
+        """Shared concepts must not appear twice under two different names."""
+        jpg, _ = self._pair()
+        merged = collect_metadata(jpg)["Embedded metadata"]
+        for canonical in ("Model", "Make", "F number", "Exposure time"):
+            self.assertNotIn(
+                canonical, merged, f"{canonical} duplicates a hachoir-named key"
+            )
+
+    def test_non_image_falls_through_to_hachoir(self):
+        wav = self.write_wav()
+        self.assertEqual(main.image_metadata(wav), OrderedDict())
+        merged = collect_metadata(wav)["Embedded metadata"]
+        if main.HACHOIR_AVAILABLE:
+            self.assertIn("MIME type", merged)
+
+    def test_unreadable_image_does_not_raise(self):
+        broken = self.write("truncated.jpg", b"\xff\xd8\xff\xe0 not really a jpeg")
+        self.assertEqual(main.image_metadata(broken), OrderedDict())
+
+    def test_no_file_handle_is_left_open(self):
+        """A leaked handle would keep a Windows lock on every file compared."""
+        target = self.write("notanimage.bin", b"\x00" * 64)
+        self.assertEqual(main.image_metadata(target), OrderedDict())
+        os.remove(target)  # PermissionError on Windows if a handle survived
+        self.assertFalse(os.path.exists(target))
+
+    def test_no_file_handle_is_left_open_on_a_real_image(self):
+        jpg, _ = self._pair()
+        self.assertTrue(main.image_metadata(jpg))
+        os.remove(jpg)
+        self.assertFalse(os.path.exists(jpg))
+
+
 class FitTextTests(unittest.TestCase):
     """Text fitting is measured in pixels; a fake measurer keeps this headless."""
 

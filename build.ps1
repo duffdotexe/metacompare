@@ -15,6 +15,7 @@ if (-not (Test-Path ".venv")) {
     --icon assets\icon.ico `
     --collect-all tkinterdnd2 `
     --collect-submodules hachoir `
+    --collect-all pillow_heif `
     main.py
 
 Write-Host "`nDone: $(Resolve-Path .\dist\MetaCompare.exe)"
