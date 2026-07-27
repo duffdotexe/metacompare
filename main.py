@@ -1380,7 +1380,6 @@ class MetaCompareApp:
             )
 
         ordered = sorted(enumerate(comparisons), key=rank)
-        single = len(comparisons) == 1
         hide_matching = self.diff_only.get()
         shown = 0
 
@@ -1389,7 +1388,9 @@ class MetaCompareApp:
             if hide_matching and not comparison.error and not groups.content:
                 continue
             shown += 1
-            parent = "" if single else self._insert_pair_node(index, comparison)
+            # Every comparison gets a header row, even a lone one: its verdict
+            # is the whole answer at a glance.
+            parent = self._insert_pair_node(index, comparison)
             if comparison.error:
                 self.tree.insert(
                     parent,
@@ -1442,7 +1443,7 @@ class MetaCompareApp:
                 tags=("group",),
             )
             self._insert_rows(node, index, comparison, groups.content)
-        elif parent:
+        else:
             self.tree.insert(
                 parent,
                 "end",

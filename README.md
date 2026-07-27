@@ -12,10 +12,11 @@ file whose name appears in both, so you can check a whole backup at a glance.
   whose name appears in both is compared as a pair. `IMG_1798.JPG` in one folder
   pairs with `IMG_1798.HEIC` in the other; names present in only one folder are
   ignored. Matching ignores case, and *Include subfolders* widens the search
-- **Differences first**: each pair is one line with a verdict you can read at a
-  glance, sorted so pairs that differ come first. Open one and the properties
-  that actually disagree are already expanded; the file's full metadata sits
-  under a collapsed *All metadata* node
+- **Differences first**: every pair — including a single file pair — is one line
+  with a verdict you can read at a glance, green when nothing differs and red
+  when something does, sorted so pairs that differ come first. Everything starts
+  collapsed; expand a pair for the properties that disagree, or its
+  *All metadata* node for the complete readout
 - Differences that follow from being two different files — name, extension,
   size, hashes, container format — are kept in their own collapsed group, so a
   `.jpg` and a `.heic` of the same shot read as *no differences* rather than
