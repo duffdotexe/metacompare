@@ -203,8 +203,24 @@ HACHOIR_KEY_ALIASES = {
     "ISOSpeedRatings": "ISO speed rating",
     "PhotographicSensitivity": "ISO speed rating",
     "DateTimeOriginal": "Date-time original",
+    "DateTimeDigitized": "Date-time digitized",
     "Orientation": "Image orientation",
+    "ExifVersion": "EXIF version",
+    "FlashPixVersion": "Flashpix version",
+    "ShutterSpeedValue": "Shutter speed",
+    "ApertureValue": "Aperture",
+    "BrightnessValue": "Camera brightness",
+    "ExposureBiasValue": "Exposure bias",
+    "FocalLengthIn35mmFilm": "Focal length in 35mm film",
 }
+
+# hachoir renders every EXIF rational with "%.3g". Matching that on the keys
+# above keeps a shared property to one row instead of splitting it into two
+# that differ only in precision.
+THREE_SIGNIFICANT_FIGURE_TAGS = frozenset({
+    "FNumber", "FocalLength", "ApertureValue", "MaxApertureValue",
+    "ShutterSpeedValue", "BrightnessValue",
+})
 
 # Matches hachoir's table so the two agree on wording.
 ORIENTATION_NAMES = {
@@ -319,7 +335,7 @@ def _format_exif_entry(tag, value):
         except (TypeError, ValueError, ZeroDivisionError):
             pass
         return None
-    if tag in ("FNumber", "FocalLength", "ApertureValue", "MaxApertureValue"):
+    if tag in THREE_SIGNIFICANT_FIGURE_TAGS:
         try:
             return key, "%.3g" % float(value)
         except (TypeError, ValueError):

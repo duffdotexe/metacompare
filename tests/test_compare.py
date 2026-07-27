@@ -298,6 +298,13 @@ class ImageMetadataTests(TempFileTestCase):
         sub[ExifTags.Base.ISOSpeedRatings] = 64
         sub[ExifTags.Base.FocalLength] = 6.86
         sub[ExifTags.Base.LensModel] = "iPhone 15 Pro back camera 6.86mm f/1.78"
+        # Properties hachoir also reports, under its own spellings.
+        sub[ExifTags.Base.DateTimeDigitized] = "2026:03:14 09:26:53"
+        sub[ExifTags.Base.ShutterSpeedValue] = 4.90712
+        sub[ExifTags.Base.ApertureValue] = 1.7
+        sub[ExifTags.Base.BrightnessValue] = -0.43684
+        sub[ExifTags.Base.ExposureBiasValue] = 0
+        sub[ExifTags.Base.FocalLengthIn35mmFilm] = 49
         gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
         gps[ExifTags.GPS.GPSLatitudeRef] = "N"
         gps[ExifTags.GPS.GPSLatitude] = (40.0, 44.0, 54.30)
@@ -393,6 +400,53 @@ class ImageMetadataTests(TempFileTestCase):
             self.assertNotIn(
                 canonical, merged, f"{canonical} duplicates a hachoir-named key"
             )
+
+    def test_no_property_appears_under_two_spellings(self):
+        """'Aperture' and 'Aperture value' are one fact, so one row."""
+        jpg, _ = self._pair()
+        merged = collect_metadata(jpg)["Embedded metadata"]
+        checked = 0
+        for tag, alias in main.HACHOIR_KEY_ALIASES.items():
+            humanized = main.humanize_tag(tag)
+            if humanized == alias or alias not in merged:
+                continue
+            checked += 1
+            self.assertNotIn(
+                humanized,
+                merged,
+                f"{alias!r} and {humanized!r} are the same property",
+            )
+        self.assertGreater(checked, 5, "the fixture exercised too few aliases")
+
+    def test_aliased_rationals_use_three_significant_figures(self):
+        """hachoir renders EXIF rationals with %.3g; shared keys must match."""
+        jpg, _ = self._pair()
+        mine = main.image_metadata(jpg)
+        self.assertEqual(mine["Shutter speed"], "4.91")
+        self.assertEqual(mine["Camera brightness"], "-0.437")
+        self.assertEqual(mine["Aperture"], "1.7")
+        self.assertEqual(mine["Camera focal"], "1.78")
+        self.assertEqual(mine["Focal length"], "6.86")
+
+    def test_shared_keys_agree_with_hachoir(self):
+        """A key both extractors report must not be formatted two ways."""
+        if not main.HACHOIR_AVAILABLE:
+            self.skipTest("hachoir not installed")
+        jpg, _ = self._pair()
+        mine = main.image_metadata(jpg)
+        theirs = main.embedded_metadata(jpg)
+        # hachoir applies %.3g only when the encoder stored the tag as an EXIF
+        # rational. Real cameras do; Pillow's writer does not, so these two
+        # legitimately disagree on this synthetic fixture while matching on
+        # real camera files.
+        encoder_dependent = {"Shutter speed", "Camera brightness"}
+        overlap = (set(mine) & set(theirs)) - encoder_dependent
+        self.assertTrue(overlap, "no overlapping keys to compare")
+        for key in sorted(overlap):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    mine[key], theirs[key], f"{key} formatted two ways"
+                )
 
     def test_non_image_falls_through_to_hachoir(self):
         wav = self.write_wav()
