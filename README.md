@@ -13,12 +13,14 @@ matches and what doesn't.
 - Compares **embedded metadata** (via [hachoir](https://github.com/vstinner/hachoir)):
   EXIF for images, ID3 for audio, duration/codec for video, document
   properties, archive info, and more — across dozens of formats
-- Color-coded results: <span title="green">same</span> / <span title="red">different</span> /
-  <span title="orange">present in only one file</span>, with a
-  *"Show differences only"* filter
+- Color-coded results: same (green) / different (red) / present in only one
+  file (orange), with a *"Show differences only"* filter
 - Double-click any row to see the full, untruncated values
 - **Copy** the comparison report to the clipboard or **save** it as a text file
 - Tells you outright when two files are **byte-identical** (matching SHA-256)
+- Keeps working on awkward inputs: a locked or unreadable file still reports
+  every property it can, with the hashes marked unreadable rather than failing
+  the whole comparison
 
 ## Download
 

@@ -1,6 +1,8 @@
 import os
+import sys
 import tempfile
 import unittest
+import wave
 from collections import OrderedDict
 
 import main
@@ -12,8 +14,18 @@ from main import (
     build_report,
     collect_metadata,
     compare_metadata,
+    files_are_identical,
+    fit_end,
+    fit_middle,
     human_size,
     summarize,
+    write_report,
+)
+
+# 1x1 transparent PNG.
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000d4944415478da63fcffff3f030005fe02fea75481840000000049454e44ae426082"
 )
 
 
@@ -68,40 +80,56 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(counts[STATUS_ONLY_2], 0)
 
 
-class EndToEndTests(unittest.TestCase):
+class TempFileTestCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
 
     def tearDown(self):
         self.dir.cleanup()
 
-    def _write(self, name, data):
-        path = os.path.join(self.dir.name, name)
-        with open(path, "wb") as fh:
-            fh.write(data)
-        return path
+    def path(self, name):
+        return os.path.join(self.dir.name, name)
 
+    def write(self, name, data):
+        target = self.path(name)
+        with open(target, "wb") as fh:
+            fh.write(data)
+        return target
+
+    def write_wav(self, name="sound.wav", frames=4410):
+        target = self.path(name)
+        with wave.open(target, "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+            w.writeframes(b"\x00\x00\x00\x00" * frames)
+        return target
+
+
+class EndToEndTests(TempFileTestCase):
     def test_identical_content_same_hashes(self):
-        p1 = self._write("a.txt", b"hello world")
-        p2 = self._write("b.txt", b"hello world")
+        p1 = self.write("a.txt", b"hello world")
+        p2 = self.write("b.txt", b"hello world")
         rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
         by_key = {key: status for _s, key, _v1, _v2, status in rows}
         self.assertEqual(by_key["SHA-256"], STATUS_SAME)
         self.assertEqual(by_key["MD5"], STATUS_SAME)
         self.assertEqual(by_key["Size"], STATUS_SAME)
         self.assertEqual(by_key["Name"], STATUS_DIFF)
+        self.assertTrue(files_are_identical(rows))
 
     def test_different_content_different_hashes(self):
-        p1 = self._write("a.txt", b"hello")
-        p2 = self._write("b.txt", b"goodbye")
+        p1 = self.write("a.txt", b"hello")
+        p2 = self.write("b.txt", b"goodbye")
         rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
         by_key = {key: status for _s, key, _v1, _v2, status in rows}
         self.assertEqual(by_key["SHA-256"], STATUS_DIFF)
         self.assertEqual(by_key["Size"], STATUS_DIFF)
+        self.assertFalse(files_are_identical(rows))
 
     def test_report_contains_paths_and_keys(self):
-        p1 = self._write("a.txt", b"x")
-        p2 = self._write("b.txt", b"y")
+        p1 = self.write("a.txt", b"x")
+        p2 = self.write("b.txt", b"y")
         rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
         report = build_report(p1, p2, rows)
         self.assertIn(p1, report)
@@ -110,18 +138,145 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Summary:", report)
 
     def test_embedded_metadata_on_png(self):
-        # Minimal 1x1 PNG — hachoir should read at least width/height.
-        png = bytes.fromhex(
-            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-            "890000000d4944415478da63fcffff3f030005fe02fea75481840000000049454e44ae426082"
-        )
-        p1 = self._write("one.png", png)
+        p1 = self.write("one.png", PNG_BYTES)
         meta = main.embedded_metadata(p1)
         if main.HACHOIR_AVAILABLE:
             self.assertTrue(
                 any("width" in k.lower() for k in meta),
                 f"expected image width in embedded metadata, got: {list(meta)}",
             )
+
+
+class EmbeddedSectionTests(TempFileTestCase):
+    """hachoir heads a file's ungrouped metadata 'Metadata' or 'Common'."""
+
+    def setUp(self):
+        super().setUp()
+        if not main.HACHOIR_AVAILABLE:
+            self.skipTest("hachoir not installed")
+
+    def test_root_metadata_keys_are_not_group_prefixed(self):
+        # A WAV's root section is titled "Common:", a PNG's "Metadata:".
+        for path in (self.write_wav(), self.write("one.png", PNG_BYTES)):
+            meta = main.embedded_metadata(path)
+            self.assertTrue(meta, f"no embedded metadata for {path}")
+            for key in meta:
+                self.assertNotIn(
+                    main.KEY_SEPARATOR,
+                    key,
+                    f"root key {key!r} was wrongly prefixed with its section title",
+                )
+
+    def test_cross_format_keys_align(self):
+        """A PNG and a WAV must compare their shared keys, not talk past each other."""
+        png = self.write("one.png", PNG_BYTES)
+        wav = self.write_wav()
+        rows = compare_metadata(collect_metadata(png), collect_metadata(wav))
+        embedded = {
+            key: status
+            for sec, key, _v1, _v2, status in rows
+            if sec == "Embedded metadata"
+        }
+        self.assertEqual(embedded.get("MIME type"), STATUS_DIFF)
+        self.assertEqual(embedded.get("Endianness"), STATUS_DIFF)
+
+    def test_hachoir_never_writes_to_stdio(self):
+        """A --windowed exe has no stdout/stderr for hachoir to write to."""
+        self.assertFalse(main._hachoir_log.use_print)
+
+
+class UnreadableFileTests(TempFileTestCase):
+    def test_hash_failure_yields_placeholder_not_an_error(self):
+        original = main._file_hashes
+
+        def boom(_path):
+            raise PermissionError(13, "Permission denied")
+
+        main._file_hashes = boom
+        try:
+            props = main.filesystem_metadata(self.write("a.txt", b"data"))
+        finally:
+            main._file_hashes = original
+        self.assertIn("unreadable", props["SHA-256"])
+        self.assertIn("Size", props)  # the rest of the metadata still arrives
+
+    def test_two_unreadable_files_are_not_called_identical(self):
+        original = main._file_hashes
+
+        def boom(_path):
+            raise PermissionError(13, "Permission denied")
+
+        main._file_hashes = boom
+        try:
+            p1 = self.write("a.txt", b"one")
+            p2 = self.write("b.txt", b"two-different")
+            rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
+        finally:
+            main._file_hashes = original
+        by_key = {key: status for _s, key, _v1, _v2, status in rows}
+        # Both placeholders match, but that is not evidence the files match.
+        self.assertEqual(by_key["SHA-256"], STATUS_SAME)
+        self.assertFalse(files_are_identical(rows))
+
+    @unittest.skipUnless(sys.platform == "win32", "file locking is Windows-specific")
+    def test_locked_file_still_compares(self):
+        import msvcrt
+
+        p1 = self.write("locked.bin", b"x" * 4096)
+        p2 = self.write("plain.bin", b"y" * 4096)
+        with open(p1, "r+b") as holder:
+            msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 4096)
+            try:
+                rows = compare_metadata(collect_metadata(p1), collect_metadata(p2))
+            finally:
+                msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 4096)
+        by_key = {key: v1 for _s, key, v1, _v2, _st in rows}
+        self.assertIn("unreadable", by_key["SHA-256"])
+        self.assertFalse(files_are_identical(rows))
+
+
+class WriteReportTests(TempFileTestCase):
+    def test_plain_report_round_trips(self):
+        target = self.path("report.txt")
+        write_report(target, "line one\nline two")
+        with open(target, encoding="utf-8") as fh:
+            self.assertIn("line one", fh.read())
+
+    def test_surrogate_in_report_does_not_lose_the_file(self):
+        """NTFS allows names with unpaired surrogates; saving must still work."""
+        target = self.path("report.txt")
+        write_report(target, "File 1: bad\udc80name.txt\nstatus: Same")
+        self.assertGreater(os.path.getsize(target), 0)
+        with open(target, encoding="utf-8") as fh:
+            self.assertIn("status: Same", fh.read())
+
+
+class FitTextTests(unittest.TestCase):
+    """Text fitting is measured in pixels; a fake measurer keeps this headless."""
+
+    @staticmethod
+    def measure(text):
+        return len(text) * 10
+
+    def test_short_text_is_untouched(self):
+        self.assertEqual(fit_end("abc", self.measure, 100), "abc")
+        self.assertEqual(fit_middle("abc", self.measure, 100), "abc")
+
+    def test_fit_end_truncates_to_budget(self):
+        result = fit_end("abcdefghijklmnop", self.measure, 50)
+        self.assertLessEqual(self.measure(result), 50)
+        self.assertTrue(result.endswith("…"))
+        self.assertTrue(result.startswith("abcd"))
+
+    def test_fit_middle_keeps_both_ends(self):
+        result = fit_middle(r"C:\Users\someone\Documents\deep\file.txt", self.measure, 100)
+        self.assertLessEqual(self.measure(result), 100)
+        self.assertTrue(result.startswith("C:"))
+        self.assertTrue(result.endswith(".txt"))
+
+    def test_impossible_budget_degrades_to_ellipsis(self):
+        self.assertEqual(fit_end("abcdef", self.measure, 1), "…")
+        self.assertEqual(fit_middle("abcdef", self.measure, 1), "…")
 
 
 if __name__ == "__main__":
